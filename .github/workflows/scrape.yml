@@ -43,7 +43,7 @@ jobs:
       # Optional: Commit latest.csv back to the repo (requires a PAT)
       # To enable: create a secret named REPO_TOKEN with a Personal Access Token (repo scope for private repos).
       - name: Commit latest.csv back to repo (optional)
-        if: secrets.REPO_TOKEN != ''
+        if: ${{ secrets.REPO_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
