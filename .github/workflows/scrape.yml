@@ -1,0 +1,52 @@
+name: Scheduled Playwright Scrape
+
+on:
+  schedule:
+    # runs daily at 06:00 Europe/Helsinki (UTC+3 in summer or +2 in winter).
+    # GitHub Actions uses UTC for cron. Example below runs at 03:00 UTC (06:00+03:00).
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}   # allows manual run from Actions UI
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: |
+          # installs necessary browsers for Playwright
+          python -m playwright install --with-deps
+
+      - name: Run scraper
+        run: |
+          mkdir -p artifacts
+          python scraper.py
+
+      - name: Upload artifacts (snapshots & deltas)
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrape-artifacts-${{ github.run_id }}
+          path: artifacts/**
+
+      # Optional: Commit latest.csv back to the repo (requires a PAT)
+      # To enable: create a secret named REPO_TOKEN with a Personal Access Token (repo scope for private repos).
+      - name: Commit latest.csv back to repo (optional)
+        if: secrets.REPO_TOKEN != ''
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add artifacts/latest.csv || true
+          git commit -m "Update latest.csv from scheduled scrape (${{ github.run_id }})" || echo "No changes to commit"
+          git push https://x-access-token:${{ secrets.REPO_TOKEN }}@github.com/${{ github.repository }} HEAD:refs/heads/${{ github.ref_name || 'main' }}
