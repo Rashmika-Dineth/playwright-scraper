@@ -1,20 +1,20 @@
+import os, sys, datetime, hashlib, pandas as pd
 from playwright.sync_api import sync_playwright
-import pandas as pd
-import hashlib, os, datetime, sys
 
-# === CONFIG ===
-URL = "https://example.com/products"  # <--- change to your target
-OUTPUT_DIR = "artifacts"               # Action-friendly directory
+# === CONFIG (override via env vars) ===
+URL = os.getenv("SCRAPE_URL", "https://example.com/products")
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/tmp/artifacts")  # ephemeral local dir
+UPLOAD_TO = os.getenv("UPLOAD_TO", "none")  # "s3", "gcs", or "none"
+BUCKET_NAME = os.getenv("BUCKET_NAME", "")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 LATEST_PATH = os.path.join(OUTPUT_DIR, "latest.csv")
 ARCHIVE_DIR = os.path.join(OUTPUT_DIR, "archive")
-LOG_PATH = os.path.join(OUTPUT_DIR, "run.log")
 os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
 def log(msg):
     ts = datetime.datetime.utcnow().isoformat()
-    print(f"[{ts}] {msg}")
-    with open(LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(f"[{ts}] {msg}\n")
+    print(f"[{ts}] {msg}", flush=True)
 
 def get_hash(value: str):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -27,11 +27,9 @@ def scrape_page():
         page.goto(URL, timeout=60000)
         page.wait_for_load_state("networkidle", timeout=60000)
 
-        # --- EDIT selectors below to suit your target site ---
         items = page.query_selector_all(".product-card")
         data = []
         for item in items:
-            # safe extraction with fallback
             name_el = item.query_selector(".product-name")
             price_el = item.query_selector(".price")
             name = name_el.inner_text().strip() if name_el else ""
@@ -44,64 +42,65 @@ def scrape_page():
         return df
 
 def detect_deltas(df_new, df_old):
-    # We treat rows present in df_new but not in df_old (by hash) as new/changed,
-    # and rows present in df_old but not in df_new as removed.
-    old_hashes = set(df_old["hash"].astype(str).tolist())
-    new_hashes = set(df_new["hash"].astype(str).tolist())
-
+    old_hashes = set(df_old["hash"].astype(str))
+    new_hashes = set(df_new["hash"].astype(str))
     added_hashes = new_hashes - old_hashes
     removed_hashes = old_hashes - new_hashes
-
     added = df_new[df_new["hash"].isin(added_hashes)].copy()
     removed = df_old[df_old["hash"].isin(removed_hashes)].copy()
     return added, removed
 
+def upload_to_cloud(path: str, dest_name: str):
+    if UPLOAD_TO == "s3":
+        import boto3
+        s3 = boto3.client("s3")
+        s3.upload_file(path, BUCKET_NAME, dest_name)
+        log(f"Uploaded to s3://{BUCKET_NAME}/{dest_name}")
+    elif UPLOAD_TO == "gcs":
+        from google.cloud import storage
+        client = storage.Client()
+        bucket = client.bucket(BUCKET_NAME)
+        blob = bucket.blob(dest_name)
+        blob.upload_from_filename(path)
+        log(f"Uploaded to gs://{BUCKET_NAME}/{dest_name}")
+    else:
+        log(f"Skipped upload (UPLOAD_TO={UPLOAD_TO})")
+
 def main():
-    try:
-        df_new = scrape_page()
-    except Exception as e:
-        log(f"ERROR during scrape: {e}")
-        raise
-
+    df_new = scrape_page()
     timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-
-    # Save new snapshot
     df_new.to_csv(LATEST_PATH, index=False)
-    log(f"Wrote latest snapshot: {LATEST_PATH}")
+    log(f"Saved latest snapshot: {LATEST_PATH}")
 
-    if os.path.exists(LATEST_PATH) and os.path.exists(LATEST_PATH) and os.path.getsize(LATEST_PATH) > 0:
-        # If an old snapshot exists in archive, try to find the latest archived snapshot
-        archived_snapshots = sorted([p for p in os.listdir(ARCHIVE_DIR) if p.startswith("snapshot_")])
-        if archived_snapshots:
-            latest_archived = archived_snapshots[-1]
-            df_old = pd.read_csv(os.path.join(ARCHIVE_DIR, latest_archived))
-        else:
-            # If no archived snapshot exists, treat empty old df
-            df_old = pd.DataFrame(columns=df_new.columns)
+    # Load previous if exists
+    prev_path = os.path.join(ARCHIVE_DIR, "last_snapshot.csv")
+    if os.path.exists(prev_path):
+        df_old = pd.read_csv(prev_path)
+    else:
+        df_old = pd.DataFrame(columns=df_new.columns)
 
-        added, removed = detect_deltas(df_new, df_old)
+    added, removed = detect_deltas(df_new, df_old)
+    if not added.empty or not removed.empty:
+        added_path = os.path.join(ARCHIVE_DIR, f"added_{timestamp}.csv")
+        removed_path = os.path.join(ARCHIVE_DIR, f"removed_{timestamp}.csv")
+        if not added.empty:
+            added.to_csv(added_path, index=False)
+            upload_to_cloud(added_path, f"added_{timestamp}.csv")
+        if not removed.empty:
+            removed.to_csv(removed_path, index=False)
+            upload_to_cloud(removed_path, f"removed_{timestamp}.csv")
+        log("Changes detected and uploaded.")
+    else:
+        log("No changes detected.")
 
-        if not added.empty or not removed.empty:
-            delta_path_added = os.path.join(ARCHIVE_DIR, f"added_{timestamp}.csv")
-            delta_path_removed = os.path.join(ARCHIVE_DIR, f"removed_{timestamp}.csv")
-            if not added.empty:
-                added.to_csv(delta_path_added, index=False)
-                log(f"Found {len(added)} added/changed rows -> {delta_path_added}")
-            if not removed.empty:
-                removed.to_csv(delta_path_removed, index=False)
-                log(f"Found {len(removed)} removed rows -> {delta_path_removed}")
-        else:
-            log("No changes detected.")
-
-    # Archive the new snapshot for next run
-    snap_archive_path = os.path.join(ARCHIVE_DIR, f"snapshot_{timestamp}.csv")
-    df_new.to_csv(snap_archive_path, index=False)
-    log(f"Archived snapshot to {snap_archive_path}")
+    # Save new snapshot for next run
+    df_new.to_csv(prev_path, index=False)
+    upload_to_cloud(prev_path, f"snapshot_{timestamp}.csv")
+    log("Completed run.")
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as exc:
-        log(f"FATAL ERROR: {exc}")
-        sys.exit(2)
-    sys.exit(0)
+    except Exception as e:
+        log(f"FATAL ERROR: {e}")
+        sys.exit(1)
